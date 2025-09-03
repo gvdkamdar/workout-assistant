@@ -7,6 +7,9 @@ from app.audio.tts import TTSEngine
 from app.common.events import EventType, SessionEvent, RepEvent, PartialEvent
 from app.data import db
 from app.counter.pipeline import PosePipeline, RepConfig
+from app.counter.web_pipeline import WebAnglePipeline
+
+
 
 Exercise = Literal["bicep_curl", "bench_press", "lateral_raise", "shoulder_press"]
 Side = Literal["left", "right", "both"]
@@ -33,6 +36,12 @@ class RepSessionManager:
         self.active_pipeline: Optional[PosePipeline] = None
         self.active_cfg: Optional[RepConfig] = None
         self.count = 0
+        self.web_mode: bool = False           # ← browser is feeding angles?
+        self.web_session_id: Optional[str] = None        
+        self._event_sink = None  # callable(dict) -> None
+
+    def set_event_sink(self, sink):
+        self._event_sink = sink
 
     def _on_rep(self, metrics: dict):
         self.count += 1
@@ -52,38 +61,107 @@ class RepSessionManager:
                 avg_ang_vel=metrics.get("avg_ang_vel_deg_s", 0.0),
                 side=self.active_cfg.side if self.active_cfg else "both",
             )
-        if self.trainer_mode:
+        # if self.trainer_mode:
+        #     self.tts.say(str(self.count))
+
+        # Speak numbers only if not in web mode (browser will TTS if web)
+        if self.trainer_mode and not self.web_mode:
             self.tts.say(str(self.count))
+
+        if self._event_sink:
+            try:
+                self._event_sink({"type":"rep", "count": self.count})
+            except Exception:
+                pass
+
+
 
     def _on_partial(self, reason: str):
         ts = time.time()
         if self.active_id:
-            db.insert_event(self.active_id, ts, self.count, 0, 0.0, self.active_cfg.side if self.active_cfg else "both", f"partial:{reason}")
-        if self.trainer_mode:
+            db.insert_event(self.active_id, ts, self.count, 0, 0.0,
+                            self.active_cfg.side if self.active_cfg else "both",
+                            f"partial:{reason}")
+        if self.trainer_mode and not self.web_mode:
             self.tts.say("partial rep")
+
+        if self._event_sink:
+            try:
+                self._event_sink({"type":"partial", "reason": reason})
+            except Exception:
+                pass
+
+        # if self.active_id:
+        #     db.insert_event(self.active_id, ts, self.count, 0, 0.0, self.active_cfg.side if self.active_cfg else "both", f"partial:{reason}")
+        # if self.trainer_mode:
+        #     self.tts.say("partial rep")
 
     def start(self, exercise: Exercise, side: Side = "both", target_reps: Optional[int] = None, mode: str = "count"):
         # stop existing
         if self.active_pipeline is not None:
             self.tts.say("stopping current session")
             self.stop(self.active_id)
+        
         sid = str(uuid.uuid4())
         self.active_id = sid
         self.count = 0
         # Per-exercise config (thresholds can be tuned here)
-        cfg = RepConfig(exercise=exercise, side=side, min_angle=45, max_angle=165, min_rom=40, velocity_eps=15, dwell_ms=150, concentric_angle_down=True)
-        if exercise in ("lateral_raise", "shoulder_press"):
-            # For these, concentric typically decreases shoulder angle relative to torso
-            cfg.concentric_angle_down = False  # example tweak; refine as needed
+        cfg = RepConfig(exercise=exercise, side=side, min_angle=45, max_angle=165, min_rom=35, velocity_eps=8, dwell_ms=150, concentric_angle_down=True)
+        # Friendlier per-exercise thresholds for front-camera 2D landmarks
+        if exercise == "bicep_curl":
+            cfg.min_rom = 22
+            cfg.velocity_eps = 10
+            cfg.concentric_angle_down = True
+        elif exercise == "lateral_raise":
+            cfg.min_rom = 28
+            cfg.velocity_eps = 12
+            cfg.concentric_angle_down = False
+        elif exercise == "shoulder_press":
+            cfg.min_rom = 24
+            cfg.velocity_eps = 10
+            cfg.concentric_angle_down = False
+        elif exercise == "bench_press":
+            cfg.min_rom = 18
+            cfg.velocity_eps = 10
+            cfg.concentric_angle_down = False
+
         self.active_cfg = cfg
 
         # persist session
         db.insert_session(sid, exercise, side, time.time(), target_reps)
 
-        # pipeline
-        pipe = PosePipeline(cfg, on_rep=self._on_rep, on_partial=self._on_partial)
+        # # pipeline
+        # pipe = PosePipeline(cfg, on_rep=self._on_rep, on_partial=self._on_partial, show_window=False, on_error=self._on_error, )
+        # self.active_pipeline = pipe
+        # pipe.start()
+
+        # >>> choose pipeline based on web mode <<<
+        if self.web_mode:
+            pipe = WebAnglePipeline(cfg, on_rep=self._on_rep, on_partial=self._on_partial)
+        else:
+            # Native Pose pipeline; tolerate older signatures
+            try:
+                pipe = PosePipeline(
+                    cfg,
+                    on_rep=self._on_rep,
+                    on_partial=self._on_partial,
+                    show_window=False,
+                    on_error=self._on_error,
+                )
+            except TypeError:
+                # fallback for older PosePipeline without show_window/on_error
+                pipe = PosePipeline(
+                    cfg,
+                    on_rep=self._on_rep,
+                    on_partial=self._on_partial,
+                )
+
+            # pipe = PosePipeline(cfg, on_rep=self._on_rep, on_partial=self._on_partial, show_window=False, on_error=self._on_error)
+
         self.active_pipeline = pipe
-        pipe.start()
+        # Only PosePipeline is threaded; WebAnglePipeline is passive
+        if hasattr(pipe, "start"):
+            pipe.start()
 
         self.tts.say(f"starting counter for {exercise.replace('_', ' ')}")
         return sid, f"started {exercise}"
@@ -102,21 +180,86 @@ class RepSessionManager:
         self.tts.say("resuming")
         return self.active_id or ""
 
-    def stop(self, session_id: Optional[str] = None) -> FinalSummary:
+    # def stop(self, session_id: Optional[str] = None) -> FinalSummary:
+    #     if self.active_pipeline is not None:
+    #         self.active_pipeline.stop()
+    #         self.active_pipeline.join(timeout=1.0)
+    #     sid = self.active_id or ""
+    #     db.stop_session(sid, time.time())
+    #     total = self.count
+    #     self.active_pipeline = None
+    #     self.active_cfg = None
+    #     self.active_id = None
+    #     self.tts.say("stopping counter")
+    #     return FinalSummary(session_id=sid, total_reps=total)
+
+    def stop(self, session_id: Optional[str]):
+        # stop active pipeline if any
         if self.active_pipeline is not None:
-            self.active_pipeline.stop()
-            self.active_pipeline.join(timeout=1.0)
-        sid = self.active_id or ""
-        db.stop_session(sid, time.time())
-        total = self.count
+            # ask pipeline to stop if it supports it
+            if hasattr(self.active_pipeline, "stop"):
+                try:
+                    self.active_pipeline.stop()
+                except Exception:
+                    pass
+            # join only if it's a thread-like object
+            if hasattr(self.active_pipeline, "join"):
+                try:
+                    self.active_pipeline.join(timeout=1.0)
+                except Exception:
+                    pass
+
+        # mark DB + clear state
+        end = time.time()
+        try:
+            if session_id:
+                db.stop_session(session_id, end)
+        except Exception:
+            pass
         self.active_pipeline = None
         self.active_cfg = None
         self.active_id = None
-        self.tts.say("stopping counter")
-        return FinalSummary(session_id=sid, total_reps=total)
+        if self.trainer_mode:
+            try:
+                self.tts.say("stopping counter")
+            except Exception:
+                pass
 
     def status(self, session_id: Optional[str] = None) -> SessionStatus:
         return SessionStatus(session_id=self.active_id or "", state=("running" if self.active_pipeline else "stopped"), count=self.count)
+
+    def _on_error(self, msg: str):
+    # Called from pipeline thread on error
+        try:
+            self.tts.say("camera error")
+        except Exception:
+            pass
+        # mark session stopped
+        sid = self.active_id or ""
+        try:
+            db.stop_session(sid, time.time())
+        except Exception:
+            pass
+        self.active_pipeline = None
+        self.active_cfg = None
+        self.active_id = None
+
+        if self._event_sink:
+            try:
+                self._event_sink({"type":"trace", "msg": f"pipeline error: {msg}"})
+            except Exception:
+                pass
+
+
+    # Enable/disable web mode (called by WS on connect/disconnect)
+    def set_web_mode(self, active: bool):
+        self.web_mode = bool(active)
+
+    # Push one angle sample from the web client
+    def push_angle(self, angle: float, ts: Optional[float] = None, side: str = "both"):
+        if isinstance(self.active_pipeline, WebAnglePipeline):
+            self.active_pipeline.push_angle(angle, ts)
+
 
 
 # Global manager factory (so tools can access a singleton cleanly)

@@ -99,7 +99,15 @@ def route_and_execute(user_text: str, verbose: bool = True) -> dict:
             steps.append(f"router: unknown tool {name} (noop)")
             result["steps"] = steps
             return result
-        out = tool.invoke(args)  # our @tool returns a string
+        
+        # OLD
+        # out = tool.invoke(args)  # our @tool returns a string
+        # NEW: prefer the raw function if available, else fall back
+        if hasattr(tool, "func"):
+            out = tool.func(**args)
+        else:
+            out = tool.invoke(args)
+        
         result["action"] = name
         result["args"] = args
         result["tool_output"] = out
