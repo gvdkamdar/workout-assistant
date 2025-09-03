@@ -9,13 +9,6 @@ A computer vision-based workout counting assistant that tracks and counts exerci
 - Web interface for workout tracking
 - Support for multiple exercise types
 
-## Development Status
-
-**Initial Build** - Currently facing camera access issues on Mac. Development will proceed with two branches:
-
-1. **No-Video Branch**: Implements counting logic without camera access for testing core functionality
-2. **Video Branch**: Full camera integration with direct video feed to web browser
-
 ## Getting Started
 
 ### Prerequisites
