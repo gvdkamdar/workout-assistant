@@ -2,7 +2,7 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Optional, Literal
+from typing import Optional, Literal, Callable
 from app.audio.tts import TTSEngine
 from app.common.events import EventType, SessionEvent, RepEvent, PartialEvent
 from app.data import db
@@ -38,9 +38,9 @@ class RepSessionManager:
         self.count = 0
         self.web_mode: bool = False           # ← browser is feeding angles?
         self.web_session_id: Optional[str] = None        
-        self._event_sink = None  # callable(dict) -> None
+        self._event_sink: Optional[Callable[[dict], None]] = None  # ← type hint
 
-    def set_event_sink(self, sink):
+    def set_event_sink(self, sink: Callable[[dict], None]):
         self._event_sink = sink
 
     def _on_rep(self, metrics: dict):
@@ -74,7 +74,21 @@ class RepSessionManager:
             except Exception:
                 pass
 
-
+    def _emit_debug(self, ev):
+        """
+        Accepts either a dict like {"type":"trace","msg": "..."} or any object;
+        normalizes and forwards to the sink so it appears in the Trace panel.
+        """
+        if self._event_sink is None:
+            return
+        try:
+            if isinstance(ev, dict):
+                payload = ev
+            else:
+                payload = {"type": "trace", "msg": str(ev)}
+            self._event_sink(payload)
+        except Exception:
+            pass
 
     def _on_partial(self, reason: str):
         ts = time.time()
@@ -96,50 +110,112 @@ class RepSessionManager:
         # if self.trainer_mode:
         #     self.tts.say("partial rep")
 
+    # def start(self, exercise: Exercise, side: Side = "both", target_reps: Optional[int] = None, mode: str = "count"):
+    #     # stop existing
+    #     if self.active_pipeline is not None:
+    #         self.tts.say("stopping current session")
+    #         self.stop(self.active_id)
+        
+    #     sid = str(uuid.uuid4())
+    #     self.active_id = sid
+    #     self.count = 0
+    #     # Per-exercise config (thresholds can be tuned here)
+    #     cfg = RepConfig(exercise=exercise, side=side, min_angle=45, max_angle=165, min_rom=35, velocity_eps=8, dwell_ms=150, concentric_angle_down=True)
+    #     # Friendlier per-exercise thresholds for front-camera 2D landmarks
+    #     if exercise == "bicep_curl":
+    #         cfg.min_rom = 22
+    #         cfg.velocity_eps = 10
+    #         cfg.concentric_angle_down = True
+    #     elif exercise == "lateral_raise":
+    #         cfg.min_rom = 28
+    #         cfg.velocity_eps = 12
+    #         cfg.concentric_angle_down = False
+    #     elif exercise == "shoulder_press":
+    #         cfg.min_rom = 24
+    #         cfg.velocity_eps = 10
+    #         cfg.concentric_angle_down = False
+    #     elif exercise == "bench_press":
+    #         cfg.min_rom = 18
+    #         cfg.velocity_eps = 10
+    #         cfg.concentric_angle_down = False
+
+    #     self.active_cfg = cfg
+
+    #     # persist session
+    #     db.insert_session(sid, exercise, side, time.time(), target_reps)
+
+    #     # # pipeline
+    #     # pipe = PosePipeline(cfg, on_rep=self._on_rep, on_partial=self._on_partial, show_window=False, on_error=self._on_error, )
+    #     # self.active_pipeline = pipe
+    #     # pipe.start()
+
+    #     # >>> choose pipeline based on web mode <<<
+    #     if self.web_mode:
+    #         pipe = WebAnglePipeline(cfg, on_rep=self._on_rep, on_partial=self._on_partial)
+    #     else:
+    #         # Native Pose pipeline; tolerate older signatures
+    #         try:
+    #             pipe = PosePipeline(
+    #                 cfg,
+    #                 on_rep=self._on_rep,
+    #                 on_partial=self._on_partial,
+    #                 show_window=False,
+    #                 on_error=self._on_error,
+    #             )
+    #         except TypeError:
+    #             # fallback for older PosePipeline without show_window/on_error
+    #             pipe = PosePipeline(
+    #                 cfg,
+    #                 on_rep=self._on_rep,
+    #                 on_partial=self._on_partial,
+    #             )
+
+    #         # pipe = PosePipeline(cfg, on_rep=self._on_rep, on_partial=self._on_partial, show_window=False, on_error=self._on_error)
+
+    #     self.active_pipeline = pipe
+    #     # Only PosePipeline is threaded; WebAnglePipeline is passive
+    #     if hasattr(pipe, "start"):
+    #         pipe.start()
+
+    #     self.tts.say(f"starting counter for {exercise.replace('_', ' ')}")
+    #     return sid, f"started {exercise}"
+
     def start(self, exercise: Exercise, side: Side = "both", target_reps: Optional[int] = None, mode: str = "count"):
-        # stop existing
+        # stop existing session if any
         if self.active_pipeline is not None:
             self.tts.say("stopping current session")
             self.stop(self.active_id)
-        
+
         sid = str(uuid.uuid4())
         self.active_id = sid
         self.count = 0
-        # Per-exercise config (thresholds can be tuned here)
+
+        # Build config (your per-exercise tuning preserved)
         cfg = RepConfig(exercise=exercise, side=side, min_angle=45, max_angle=165, min_rom=35, velocity_eps=8, dwell_ms=150, concentric_angle_down=True)
-        # Friendlier per-exercise thresholds for front-camera 2D landmarks
         if exercise == "bicep_curl":
-            cfg.min_rom = 22
-            cfg.velocity_eps = 10
-            cfg.concentric_angle_down = True
+            cfg.min_rom = 22; cfg.velocity_eps = 10; cfg.concentric_angle_down = True
         elif exercise == "lateral_raise":
-            cfg.min_rom = 28
-            cfg.velocity_eps = 12
-            cfg.concentric_angle_down = False
+            cfg.min_rom = 28; cfg.velocity_eps = 12; cfg.concentric_angle_down = False
         elif exercise == "shoulder_press":
-            cfg.min_rom = 24
-            cfg.velocity_eps = 10
-            cfg.concentric_angle_down = False
+            cfg.min_rom = 24; cfg.velocity_eps = 10; cfg.concentric_angle_down = False
         elif exercise == "bench_press":
-            cfg.min_rom = 18
-            cfg.velocity_eps = 10
-            cfg.concentric_angle_down = False
+            cfg.min_rom = 18; cfg.velocity_eps = 10; cfg.concentric_angle_down = False
 
         self.active_cfg = cfg
 
-        # persist session
+        # Persist session
         db.insert_session(sid, exercise, side, time.time(), target_reps)
 
-        # # pipeline
-        # pipe = PosePipeline(cfg, on_rep=self._on_rep, on_partial=self._on_partial, show_window=False, on_error=self._on_error, )
-        # self.active_pipeline = pipe
-        # pipe.start()
-
-        # >>> choose pipeline based on web mode <<<
+        # Choose pipeline
         if self.web_mode:
-            pipe = WebAnglePipeline(cfg, on_rep=self._on_rep, on_partial=self._on_partial)
+            pipe = WebAnglePipeline(
+                cfg,
+                on_rep=self._on_rep,
+                on_partial=self._on_partial,
+                debug_cb=self._emit_debug,     # ← pass debug down to detector
+            )
         else:
-            # Native Pose pipeline; tolerate older signatures
+            # Try PosePipeline with debug if it supports it; fall back gracefully
             try:
                 pipe = PosePipeline(
                     cfg,
@@ -147,24 +223,37 @@ class RepSessionManager:
                     on_partial=self._on_partial,
                     show_window=False,
                     on_error=self._on_error,
+                    debug_cb=self._emit_debug,  # ← some versions may not accept this
                 )
             except TypeError:
-                # fallback for older PosePipeline without show_window/on_error
-                pipe = PosePipeline(
-                    cfg,
-                    on_rep=self._on_rep,
-                    on_partial=self._on_partial,
-                )
-
-            # pipe = PosePipeline(cfg, on_rep=self._on_rep, on_partial=self._on_partial, show_window=False, on_error=self._on_error)
+                try:
+                    pipe = PosePipeline(
+                        cfg,
+                        on_rep=self._on_rep,
+                        on_partial=self._on_partial,
+                        show_window=False,
+                        on_error=self._on_error,
+                    )
+                except TypeError:
+                    pipe = PosePipeline(
+                        cfg,
+                        on_rep=self._on_rep,
+                        on_partial=self._on_partial,
+                    )
 
         self.active_pipeline = pipe
-        # Only PosePipeline is threaded; WebAnglePipeline is passive
         if hasattr(pipe, "start"):
             pipe.start()
 
         self.tts.say(f"starting counter for {exercise.replace('_', ' ')}")
+        # emit an explicit trace line too
+        self._emit_debug({"type":"trace","msg":f"session started: {exercise} ({side})"})
         return sid, f"started {exercise}"
+
+    # push_angle stays the same, but rename to match server if needed
+    def push_angle(self, angle: float, ts: Optional[float] = None, side: str = "both"):
+        if isinstance(self.active_pipeline, WebAnglePipeline):
+            self.active_pipeline.push_angle(angle, ts, side)
 
     def pause(self, session_id: Optional[str] = None) -> str:
         if self.active_pipeline is None:
